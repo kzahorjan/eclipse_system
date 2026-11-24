@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Eclipse System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #62C46A;
+    font-family: 'Inter', sans-serif;
+    color: #222;
+    overflow: hidden;
+  }
+  #stage {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: default;
+    position: relative;
+    z-index: 1;
+  }
+  .eclipse {
+    cursor: grab;
+  }
+  .eclipse.dragging {
+    cursor: grabbing;
+  }
+  .orbit-path {
+    fill: none;
+    stroke: #000000;
+    stroke-width: 1;
+    stroke-dasharray: 3 4;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    pointer-events: none;
+  }
+  .orbit-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 16;
+    cursor: move;
+    pointer-events: none;
+  }
+  #stage.detail-mode .orbit-hit {
+    pointer-events: auto;
+  }
+  .orbit-path,
+  .distance-line,
+  .distance-label {
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  #stage.detail-mode .orbit-path,
+  #stage.detail-mode .distance-line,
+  #stage.detail-mode .distance-label {
+    opacity: 1;
+  }
+  .distance-line {
+    stroke: #000000;
+    stroke-width: 1.2;
+    stroke-dasharray: 4 4;
+    pointer-events: none;
+  }
+  .distance-label {
+    font-family: 'Inter', sans-serif;
+    font-size: 16.5px;
+    fill: #000000;
+    pointer-events: none;
+    text-anchor: middle;
+  }
+  .mode-pad {
+    position: fixed;
+    top: 24px;
+    right: 28px;
+    width: 41px;
+    height: 41px;
+    border: 1px solid #000;
+    border-radius: 10px;
+    box-sizing: border-box;
+    cursor: pointer;
+    z-index: 2;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mode-pad::before,
+  .mode-pad::after {
+    content: "";
+    position: absolute;
+    background: #000;
+    pointer-events: none;
+  }
+  .mode-pad::before {
+    left: 50%;
+    top: 4px;
+    bottom: 4px;
+    width: 1px;
+  }
+  .mode-pad::after {
+    top: 50%;
+    left: 4px;
+    right: 4px;
+    height: 1px;
+  }
+  .mode-pad-knob {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #000;
+    transition: left 0.15s ease, top 0.15s ease;
+    pointer-events: none;
+  }
+  #stage.outline-mode .eclipse circle {
+    fill: none;
+    stroke: #000000;
+    stroke-width: 1px;
+    stroke-dasharray: 3 4;
+  }
+</style>
+</head>
+<body>
+
+<svg id="stage" viewBox="0 0 800 680" xmlns="http://www.w3.org/2000/svg">
+  <!-- orbit guide paths and eclipse groups are injected by JS -->
+</svg>
+
+<div id="modePad" class="mode-pad" role="button" aria-label="Cycle guides/outline mode">
+  <span id="modeKnob" class="mode-pad-knob"></span>
+</div>
+<script>
+(function () {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("stage");
+
+  // "goo" filter: blur then sharpen alpha via a contrast matrix, so
+  // eclipses that overlap or get close blend into one shape instead of
+  // showing two hard-edged circles
+  svg.insertAdjacentHTML(
+    "afterbegin",
+    `<defs>
+    <filter id="goo" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="26" result="blur" />
+      <feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 35 -15" result="goo" />
+      <feFlood flood-color="#A3C8DA" result="strokeColor" id="gooFloodColor" />
+      <feComposite in="strokeColor" in2="goo" operator="in" result="coloredGoo" />
+      <feMerge>
+        <feMergeNode in="coloredGoo" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    </defs>`
+  );
+
+  // all eclipse shapes live inside this group so the goo filter applies to
+  // their combined alpha, not to the (separately layered) orbit rings/labels
+  const gooGroup = document.createElementNS(NS, "g");
+  gooGroup.setAttribute("filter", "url(#goo)");
+  svg.appendChild(gooGroup);
+
+  const FILL = "#6295C4";
+  const STROKE = "#A3C8DA";
+  const STROKE_W = 21;
+  const ORBIT_D = 233; // every orbit shares this diameter, per spec
+  const ORBIT_R = ORBIT_D / 2;
+  const ORBIT_SQUASH = 1; // orbits are perfect circles at rest
+  const ORBIT_SQUASH_AMP = 0.045; // ±4.5% slow breathing on the orbit path
+  const BODY_SQUASH_AMP = 0.035; // ±3.5% slow breathing on the eclipse body
+  const TICK_STEP = (2 * Math.PI) / 24; // clock-style tick every 15 degrees of travel
+  let animClock = 0; // updated once per frame in tick(), read by the squash helpers
+
+  // ----- starting layout: evenly-spaced circles, bottoms aligned ----------
+  const GAP = 50; // gap between circle edges
+  const BASELINE_Y = 440;
+  // continuing the Fibonacci sequence in both directions from 89/144/233
+  const diameters = [610, 377, 233, 144, 89]; // large -> small, left to right
+  const radii = diameters.map((d) => d / 2);
+
+  let cursorX = radii[0]; // left edge starts at x=0
+  const centers = radii.map((r, i) => {
+    if (i > 0) cursorX += radii[i - 1] + GAP + r;
+    return { x: cursorX, y: BASELINE_Y - r };
+  });
+
+  const ANGLE0 = -60; // starting position on the orbit, degrees
+
+  // sorted descending by diameter here; `order` (ascending) drives the
+  // gear-chain sign used in propagate()
+  const specs = diameters.map((d, i) => ({
+    name: `eclipse-${i}`,
+    diameter: d,
+    center: centers[i],
+    angle0: ANGLE0,
+  }));
+
+  const objects = specs.map((s) => {
+    const r = s.diameter / 2;
+    const rad = (s.angle0 * Math.PI) / 180;
+    // pivot placed so the object starts exactly at its intended center,
+    // offset by the shared orbit radius (not its own radius)
+    const pivot = {
+      x: s.center.x - ORBIT_R * Math.cos(rad),
+      y: s.center.y - ORBIT_R * ORBIT_SQUASH * Math.sin(rad),
+    };
+    return {
+      name: s.name,
+      diameter: s.diameter,
+      radius: r,
+      orbitR: ORBIT_R, // shared 233px orbit diameter for every object
+      pivot,
+      angle: rad,
+      dir: null, // set below once sorted ascending
+      baseOmega: 0,
+      // three non-harmonically-related noise layers per object, so the
+      // combined speed wobble reads as organic/uneven rather than a clean
+      // single oscillation
+      jitterPhase: Math.random() * Math.PI * 2,
+      jitterFreq: 0.35 + Math.random() * 0.3,
+      jitterPhase2: Math.random() * Math.PI * 2,
+      jitterFreq2: 0.9 + Math.random() * 0.4,
+      jitterPhase3: Math.random() * Math.PI * 2,
+      jitterFreq3: 1.8 + Math.random() * 0.6,
+      // slow, independent phase/freq per object so the breathing squash on
+      // the orbit path and on the eclipse body drift out of sync with
+      // each other and between objects, reading as organic not mechanical
+      orbitSquashPhase: Math.random() * Math.PI * 2,
+      orbitSquashFreq: 0.12 + Math.random() * 0.08,
+      bodySquashPhase: Math.random() * Math.PI * 2,
+      bodySquashFreq: 0.15 + Math.random() * 0.1,
+      tickBucket: Math.floor(rad / TICK_STEP),
+      el: null,
+      fillEl: null,
+    };
+  });
+
+  // assign gear-chain order ascending by size (small=0 .. large=n-1)
+  objects
+    .slice()
+    .sort((a, b) => a.diameter - b.diameter)
+    .forEach((o, i) => {
+      o.order = i;
+      o.dir = i % 2 === 0 ? 1 : -1;
+      o.baseOmega = (2 * Math.PI) / (8 + i * 4);
+    });
+
+  // ----- size the canvas to fit every eclipse + its full orbit swing -----
+  const MARGIN = 30;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  objects.forEach((o) => {
+    minX = Math.min(minX, o.pivot.x - o.orbitR);
+    maxX = Math.max(maxX, o.pivot.x + o.orbitR);
+    minY = Math.min(minY, o.pivot.y - o.orbitR * ORBIT_SQUASH);
+    maxY = Math.max(maxY, o.pivot.y + o.orbitR * ORBIT_SQUASH);
+  });
+  svg.setAttribute(
+    "viewBox",
+    `${minX - MARGIN} ${minY - MARGIN} ${maxX - minX + MARGIN * 2} ${maxY - minY + MARGIN * 2}`
+  );
+
+  // ----- build SVG elements -------------------------------------------
+  // eclipse fills are added first so orbit rings/hit-areas can be layered
+  // on top afterward — otherwise a big eclipse can visually and
+  // pointer-block a smaller orbit ring sitting underneath it
+  objects.forEach((o) => {
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("class", "eclipse");
+    g.dataset.name = o.name;
+
+    const rPath = o.radius - STROKE_W / 2;
+    const circle = document.createElementNS(NS, "circle");
+    circle.setAttribute("r", Math.max(rPath, 1));
+    circle.setAttribute("fill", FILL);
+    circle.setAttribute("stroke", STROKE);
+    circle.setAttribute("stroke-width", STROKE_W);
+
+    g.appendChild(circle);
+    gooGroup.appendChild(g);
+
+    o.el = g;
+    o.fillEl = circle;
+  });
+
+  objects.forEach((o) => {
+    const orbitGroup = document.createElementNS(NS, "g");
+    orbitGroup.setAttribute("class", "orbit-group");
+    svg.appendChild(orbitGroup);
+    o.orbitGroupEl = orbitGroup;
+
+    // orbit guide circle (dashed), centered on the pivot — hidden until hover
+    const guide = document.createElementNS(NS, "ellipse");
+    guide.setAttribute("class", "orbit-path");
+    guide.setAttribute("rx", o.orbitR);
+    guide.setAttribute("ry", o.orbitR * ORBIT_SQUASH);
+    orbitGroup.appendChild(guide);
+    o.guideEl = guide;
+
+    // wider invisible ring so the orbit is easy to grab and drag
+    const hit = document.createElementNS(NS, "ellipse");
+    hit.setAttribute("class", "orbit-hit");
+    hit.setAttribute("rx", o.orbitR);
+    hit.setAttribute("ry", o.orbitR * ORBIT_SQUASH);
+    orbitGroup.appendChild(hit);
+    o.hitEl = hit;
+
+    // dashed line + pixel readout showing live distance from the orbit
+    // center (pivot) to the eclipse's current center
+    const distLine = document.createElementNS(NS, "line");
+    distLine.setAttribute("class", "distance-line");
+    orbitGroup.appendChild(distLine);
+    o.distLineEl = distLine;
+
+    const distLabel = document.createElementNS(NS, "text");
+    distLabel.setAttribute("class", "distance-label");
+    orbitGroup.appendChild(distLabel);
+    o.distLabelEl = distLabel;
+
+    updateOrbitVisuals(o);
+  });
+
+  // ----- geometry helpers -----------------------------------------------
+  function orbitSquashFor(o) {
+    return ORBIT_SQUASH + ORBIT_SQUASH_AMP * Math.sin(animClock * 0.001 * o.orbitSquashFreq + o.orbitSquashPhase);
+  }
+  function bodySquashFor(o) {
+    return 1 + BODY_SQUASH_AMP * Math.sin(animClock * 0.001 * o.bodySquashFreq + o.bodySquashPhase);
+  }
+
+  function centerOf(o) {
+    return {
+      x: o.pivot.x + o.orbitR * Math.cos(o.angle),
+      y: o.pivot.y + o.orbitR * orbitSquashFor(o) * Math.sin(o.angle),
+    };
+  }
+
+  function updateOrbitVisuals(o) {
+    o.guideEl.setAttribute("cx", o.pivot.x);
+    o.guideEl.setAttribute("cy", o.pivot.y);
+    o.hitEl.setAttribute("cx", o.pivot.x);
+    o.hitEl.setAttribute("cy", o.pivot.y);
+  }
+
+  function render(o) {
+    const c = centerOf(o);
+
+    // the orbit ring's vertical radius breathes along with the actual
+    // path, so the dashed guide always matches where the eclipse travels
+    const orbitRy = o.orbitR * orbitSquashFor(o);
+    o.guideEl.setAttribute("ry", orbitRy);
+    o.hitEl.setAttribute("ry", orbitRy);
+
+    const bodySquash = bodySquashFor(o);
+    o.el.setAttribute("transform", `translate(${c.x},${c.y}) scale(1,${bodySquash})`);
+
+    // clock-style tick as the eclipse crosses each 15-degree boundary
+    const bucket = Math.floor(o.angle / TICK_STEP);
+    if (bucket !== o.tickBucket) {
+      o.tickBucket = bucket;
+      playTick(o);
+    }
+
+    // live distance readout from pivot (orbit center) to eclipse center
+    const dx = c.x - o.pivot.x;
+    const dy = c.y - o.pivot.y;
+    const dist = Math.round(Math.sqrt(dx * dx + dy * dy));
+    o.distLineEl.setAttribute("x1", o.pivot.x);
+    o.distLineEl.setAttribute("y1", o.pivot.y);
+    o.distLineEl.setAttribute("x2", c.x);
+    o.distLineEl.setAttribute("y2", c.y);
+    o.distLabelEl.setAttribute("x", (o.pivot.x + c.x) / 2);
+    o.distLabelEl.setAttribute("y", (o.pivot.y + c.y) / 2 - 6);
+    o.distLabelEl.textContent = `${dist}px`;
+  }
+
+  function shortestDelta(a, b) {
+    // wrapped difference b-a in (-PI, PI]
+    let d = b - a;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    return d;
+  }
+
+  // dragging one eclipse rotates the other two like a meshed gear train:
+  // adjacent gears spin opposite directions, speed scaled by diameter ratio
+  function propagate(driver, deltaAngle) {
+    objects.forEach((o) => {
+      if (o === driver) return;
+      const sign = (Math.abs(o.order - driver.order) % 2 === 0) ? 1 : -1;
+      const ratio = driver.diameter / o.diameter;
+      o.angle += deltaAngle * ratio * sign;
+      render(o);
+    });
+  }
+
+  // ----- drag interaction -------------------------------------------------
+  let dragging = null; // object currently being dragged (rotate or move)
+  let dragMode = null; // "rotate" | "move"
+  let moveStart = null; // { mouse: {x,y}, pivot: {x,y} } — only for "move"
+  let inertiaActive = null; // the object currently spinning freely, or null
+
+  const MAX_ANGULAR_VEL = 18; // rad/s clamp, guards against noisy fast flicks
+  const FRICTION = 1.1; // higher = spin dies out faster
+  const SPIN_STOP_EPS = 0.04; // rad/s below which spinning is considered stopped
+  const SPIN_LAUNCH_EPS = 0.5; // rad/s minimum needed to launch a spin on release
+  const EASE_RATE = 5; // higher = snappier follow, lower = more lag/resistance while dragging
+
+  // ----- lightweight synthesized sound effects (no audio files needed) ---
+  let audioCtx = null;
+  function getAudioCtx() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  }
+  // short filtered-noise click, like a clock escapement — only plays once
+  // audio has actually been unlocked by a real user gesture
+  function playTick(o) {
+    if (!audioCtx || audioCtx.state !== "running") return;
+    const ctx = audioCtx;
+    const bufferSize = Math.floor(ctx.sampleRate * 0.03);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+    }
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.value = Math.max(1000, 4200 - o.diameter * 4); // smaller = sharper click
+    filter.Q.value = 1.1;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.05, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.05);
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+    noise.start();
+  }
+
+  function svgPoint(evt) {
+    const pt = svg.createSVGPoint();
+    pt.x = evt.clientX;
+    pt.y = evt.clientY;
+    const ctm = svg.getScreenCTM().inverse();
+    return pt.matrixTransform(ctm);
+  }
+
+  objects.forEach((o) => {
+    o.el.addEventListener("pointerdown", (evt) => {
+      dragging = o;
+      dragMode = "rotate";
+      if (inertiaActive === o) inertiaActive = null;
+      o.angularVelocity = 0;
+      o.targetAngle = o.angle;
+      o.lastMoveTime = performance.now();
+      o.el.classList.add("dragging");
+      o.el.setPointerCapture(evt.pointerId);
+      getAudioCtx(); // unlock audio on first real gesture, no sound played here
+      evt.preventDefault();
+    });
+
+    o.hitEl.addEventListener("pointerdown", (evt) => {
+      dragging = o;
+      dragMode = "move";
+      moveStart = { mouse: svgPoint(evt), pivot: { ...o.pivot } };
+      o.hitEl.setPointerCapture(evt.pointerId);
+      getAudioCtx();
+      evt.preventDefault();
+    });
+  });
+
+  svg.addEventListener("pointermove", (evt) => {
+    if (!dragging) return;
+    const p = svgPoint(evt);
+
+    if (dragMode === "rotate") {
+      // just record where the pointer wants the eclipse to be; the actual
+      // angle eases toward this target every frame in tick(), so fast
+      // pointer moves produce a lagging, rubber-band follow instead of an
+      // instant snap
+      dragging.targetAngle = Math.atan2(
+        (p.y - dragging.pivot.y) / ORBIT_SQUASH,
+        p.x - dragging.pivot.x
+      );
+    } else if (dragMode === "move") {
+      dragging.pivot = {
+        x: moveStart.pivot.x + (p.x - moveStart.mouse.x),
+        y: moveStart.pivot.y + (p.y - moveStart.mouse.y),
+      };
+      updateOrbitVisuals(dragging);
+      render(dragging);
+    }
+  });
+
+  function endDrag() {
+    if (!dragging) return;
+    if (dragMode === "rotate") {
+      dragging.el.classList.remove("dragging");
+      if (Math.abs(dragging.angularVelocity) > SPIN_LAUNCH_EPS) {
+        inertiaActive = dragging;
+      }
+    }
+    dragging = null;
+    dragMode = null;
+    moveStart = null;
+  }
+  svg.addEventListener("pointerup", endDrag);
+  svg.addEventListener("pointercancel", endDrag);
+  svg.addEventListener("pointerleave", endDrag);
+
+  // ----- idle animation loop --------------------------------------------
+  let last = performance.now();
+  function tick(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    animClock = now;
+
+    if (dragging && dragMode === "rotate") {
+      // ease current angle toward the pointer-driven target angle
+      const o = dragging;
+      const delta = shortestDelta(o.angle, o.targetAngle);
+      const easeFactor = 1 - Math.exp(-EASE_RATE * dt);
+      const step = delta * easeFactor;
+      o.angle += step;
+
+      // smoothed instantaneous angular velocity, for release momentum
+      const instVel = dt > 0 ? Math.max(-MAX_ANGULAR_VEL, Math.min(MAX_ANGULAR_VEL, step / dt)) : 0;
+      o.angularVelocity = o.angularVelocity * 0.7 + instVel * 0.3;
+
+      render(o);
+      propagate(o, step);
+    } else if (!dragging) {
+      if (inertiaActive) {
+        // free-spin the released eclipse, decaying with friction, while it
+        // continues to drive the other two through the same gear coupling
+        const o = inertiaActive;
+        const deltaAngle = o.angularVelocity * dt;
+        o.angle += deltaAngle;
+        render(o);
+        propagate(o, deltaAngle);
+
+        o.angularVelocity *= Math.exp(-FRICTION * dt);
+        if (Math.abs(o.angularVelocity) < SPIN_STOP_EPS) {
+          inertiaActive = null;
+        }
+      } else {
+        objects.forEach((o) => {
+          const jitter =
+            1 +
+            0.16 * Math.sin(now * 0.001 * o.jitterFreq + o.jitterPhase) +
+            0.09 * Math.sin(now * 0.001 * o.jitterFreq2 + o.jitterPhase2) +
+            0.05 * Math.sin(now * 0.001 * o.jitterFreq3 + o.jitterPhase3);
+          o.angle += o.baseOmega * o.dir * jitter * dt;
+          render(o);
+        });
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  objects.forEach(render);
+  requestAnimationFrame(tick);
+
+  // ----- combined 2-axis mode pad: 4 modes from 2 independent axes -----
+  // vertical axis: top = guides visible, bottom = guides hidden
+  // horizontal axis: left = filled eclipses, right = stroke-only outline
+  const modePad = document.getElementById("modePad");
+  const modeKnob = document.getElementById("modeKnob");
+  const gooFloodColor = document.getElementById("gooFloodColor");
+  const PAD_SIZE = 41;
+  const KNOB_SIZE = 12;
+  let detailMode = true;
+  let outlineMode = false;
+
+  function applyModes() {
+    svg.classList.toggle("detail-mode", detailMode);
+    svg.classList.toggle("outline-mode", outlineMode);
+    gooFloodColor.setAttribute("flood-color", outlineMode ? "#000000" : "#A3C8DA");
+
+    const qx = outlineMode ? PAD_SIZE * 0.75 : PAD_SIZE * 0.25;
+    const qy = detailMode ? PAD_SIZE * 0.25 : PAD_SIZE * 0.75;
+    modeKnob.style.left = `${qx - KNOB_SIZE / 2}px`;
+    modeKnob.style.top = `${qy - KNOB_SIZE / 2}px`;
+  }
+
+  modePad.addEventListener("click", (evt) => {
+    const rect = modePad.getBoundingClientRect();
+    const x = evt.clientX - rect.left;
+    const y = evt.clientY - rect.top;
+    outlineMode = x > rect.width / 2;
+    detailMode = y < rect.height / 2;
+    applyModes();
+  });
+
+  applyModes();
+})();
+</script>
+
+</body>
+</html>
